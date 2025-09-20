@@ -84,31 +84,109 @@ jobs:
           path: "rustscan-package-${{ github.run_id }}.tar.gz"
           retention-days: 1
 
-  distribute_and_trigger_scanners:
-    name: Distribute & Trigger Scanners
+distribute_and_trigger_scanners:
+    name: Distribute Work & Trigger Scanners
     needs: prepare_rustscan_chunks
     if: needs.prepare_rustscan_chunks.outputs.total_chunks_count > 0
     runs-on: ubuntu-latest
     outputs:
       primary_matrix_json: ${{ steps.calculate_distribution.outputs.primary_matrix }}
     steps:
-      - name: Calculate Chunk Distribution
+      - name: Calculate Chunk Distribution for Accounts
         id: calculate_distribution
         shell: bash
         run: |
           ALL_CHUNKS_JSON='${{ needs.prepare_rustscan_chunks.outputs.all_chunks_matrix_json }}'
           TOTAL_CHUNKS=${{ needs.prepare_rustscan_chunks.outputs.total_chunks_count }}
-          if [ "$TOTAL_CHUNKS" -lt "$DISTRIBUTION_THRESHOLD" ]; then
-            PRIMARY_CHUNKS_JSON="$ALL_CHUNKS_JSON"; SECONDARY_CHUNKS_JSON="[]"; TERTIARY_CHUNKS_JSON="[]"
+          THRESHOLD=${{ env.DISTRIBUTION_THRESHOLD }}
+          if [ "$TOTAL_CHUNKS" -lt "$THRESHOLD" ]; then
+            PRIMARY_CHUNKS_JSON="$ALL_CHUNKS_JSON"
+            SECONDARY_CHUNKS_JSON="[]"
+            TERTIARY_CHUNKS_JSON="[]"
           else
-            PRIMARY_CHUNK_COUNT=$(echo "($TOTAL_CHUNKS * $PRIMARY_PERCENTAGE) / 100" | bc); SECONDARY_CHUNK_COUNT=$(echo "($TOTAL_CHUNKS * $SECONDARY_PERCENTAGE) / 100" | bc); OFFSET_FOR_TERTIARY=$((PRIMARY_CHUNK_COUNT + SECONDARY_CHUNK_COUNT))
+            PRIMARY_PERCENT=${{ env.PRIMARY_PERCENTAGE }}
+            SECONDARY_PERCENT=${{ env.SECONDARY_PERCENTAGE }}
+            PRIMARY_CHUNK_COUNT=$(echo "($TOTAL_CHUNKS * $PRIMARY_PERCENT) / 100" | bc)
+            SECONDARY_CHUNK_COUNT=$(echo "($TOTAL_CHUNKS * $SECONDARY_PERCENT) / 100" | bc)
+            OFFSET_FOR_TERTIARY=$((PRIMARY_CHUNK_COUNT + SECONDARY_CHUNK_COUNT))
             PRIMARY_CHUNKS_JSON=$(echo "$ALL_CHUNKS_JSON" | jq -c --argjson limit "$PRIMARY_CHUNK_COUNT" '.[0:$limit]')
             SECONDARY_CHUNKS_JSON=$(echo "$ALL_CHUNKS_JSON" | jq -c --argjson offset "$PRIMARY_CHUNK_COUNT" --argjson limit "$SECONDARY_CHUNK_COUNT" '.[$offset : $offset+$limit]')
             TERTIARY_CHUNKS_JSON=$(echo "$ALL_CHUNKS_JSON" | jq -c --argjson offset "$OFFSET_FOR_TERTIARY" '.[$offset:]')
           fi
-          echo "primary_matrix=${PRIMARY_CHUNKS_JSON}" >> $GITHUB_OUTPUT
+          
+          echo "primary_matrix=$PRIMARY_CHUNKS_JSON" >> $GITHUB_OUTPUT
+          echo "secondary_matrix=$SECONDARY_CHUNKS_JSON" >> $GITHUB_OUTPUT
+          echo "tertiary_matrix=$TERTIARY_CHUNKS_JSON" >> $GITHUB_OUTPUT
+      
+      - name: Prepare Trigger Payload For Secondary
+        id: prepare_payload_secondary
+        if: steps.calculate_distribution.outputs.secondary_matrix != '[]'
+        shell: bash
+        run: |
+          MATRIX_AS_STRING='${{ steps.calculate_distribution.outputs.secondary_matrix }}'
+          JSON_PAYLOAD=$(jq -cn \
+            --arg repo_owner "${{ github.repository_owner }}" \
+            --arg repo_name "${{ github.event.repository.name }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg artifact_name "${{ needs.prepare_rustscan_chunks.outputs.chunk_package_artifact_name }}" \
+            --arg matrix_as_a_string "$MATRIX_AS_STRING" \
+            '{
+              "primary_repo_owner": $repo_owner,
+              "primary_repo_name": $repo_name,
+              "primary_run_id": $run_id,
+              "chunk_package_artifact_name": $artifact_name,
+              "secondary_matrix_json": $matrix_as_a_string
+            }')
+          echo "json_string=$JSON_PAYLOAD" >> $GITHUB_OUTPUT
+      
+      - name: Trigger Secondary Account Workflow
+        if: steps.calculate_distribution.outputs.secondary_matrix != '[]'
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: rusty_scan_rec.yml
+          repo: ${{ secrets.ACCOUNT2_REPO_OWNER }}/${{ secrets.ACCOUNT2_REPO_NAME }}
+          token: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
+          inputs: ${{ steps.prepare_payload_secondary.outputs.json_string }}
+          ref: main
+      - name: Add Delay Between API Triggers for Tertiary Account
+        if: steps.calculate_distribution.outputs.tertiary_matrix != '[]'
+        run: |
+          echo "Pausing for 30 seconds to avoid API rate-limiting before triggering the Tertiary account..."
+          sleep 30
+      
+      - name: Prepare Trigger Payload For Tertiary
+        id: prepare_payload_tertiary
+        if: steps.calculate_distribution.outputs.tertiary_matrix != '[]'
+        shell: bash
+        run: |
+          MATRIX_AS_STRING='${{ steps.calculate_distribution.outputs.tertiary_matrix }}'
+          JSON_PAYLOAD=$(jq -cn \
+             --arg repo_owner "${{ github.repository_owner }}" \
+             --arg repo_name "${{ github.event.repository.name }}" \
+             --arg run_id "${{ github.run_id }}" \
+             --arg artifact_name "${{ needs.prepare_rustscan_chunks.outputs.chunk_package_artifact_name }}" \
+             --arg matrix_as_a_string "$MATRIX_AS_STRING" \
+             '{
+               "primary_repo_owner": $repo_owner,
+               "primary_repo_name": $repo_name,
+               "primary_run_id": $run_id,
+               "chunk_package_artifact_name": $artifact_name,
+               "tertiary_matrix_json": $matrix_as_a_string
+             }')
+          
+          echo "json_string=$JSON_PAYLOAD" >> $GITHUB_OUTPUT
+     
+      - name: Trigger Tertiary Account Workflow
+        if: steps.calculate_distribution.outputs.tertiary_matrix != '[]'
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: rusty_scan_tertiary.yml
+          repo: ${{ secrets.ACCOUNT3_REPO_OWNER }}/${{ secrets.ACCOUNT3_REPO_NAME }}
+          token: ${{ secrets.PAT_FOR_TERTIARY_ACCOUNT_REPO }}
+          inputs: ${{ steps.prepare_payload_tertiary.outputs.json_string }}
+          ref: main
 
-  run_primary_account_scan:
+run_primary_account_scan:
     name: Run Port Scan (Primary)
     needs: [prepare_rustscan_chunks, distribute_and_trigger_scanners]
     if: needs.prepare_rustscan_chunks.outputs.total_chunks_count > 0

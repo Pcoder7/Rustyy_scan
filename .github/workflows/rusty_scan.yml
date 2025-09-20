@@ -4,27 +4,34 @@ name: Distributed Port Scanning (RustScan)
 on:
   workflow_dispatch:
     inputs:
+      # --- Automated Trigger Inputs ---
       correlation_id:
-        description: 'The run_id from the parent enumeration workflow'
-        required: true
+        description: 'AUTOMATED: The run_id from the parent enumeration workflow'
+        required: false
       results_repo_owner:
-        description: 'Owner of the repo where results are stored (e.g., account2)'
-        required: true
+        description: 'AUTOMATED: Owner of the repo where results are stored'
+        required: false
       results_repo_name:
-        description: 'Name of the repo where results are stored (e.g., store-recon)'
-        required: true
+        description: 'AUTOMATED: Name of the repo where results are stored'
+        required: false
+      # --- Manual Trigger Input ---
+      manual_input_file:
+        description: 'MANUAL: Path to a massdns.txt formatted file in this repo to scan'
+        required: false
+        default: ''
 
 permissions:
   contents: write
   actions: write
 
 env:
+  # Use automated input if available, otherwise fallback to a default or leave empty
+  STORE_REPO_NAME: ${{ github.event.inputs.results_repo_name || secrets.STORE }}
+  ACCOUNT2_REPO_OWNER: ${{ github.event.inputs.results_repo_owner || secrets.ACCOUNT2_REPO_OWNER }}
+  # --- Static Distribution Config ---
   DISTRIBUTION_THRESHOLD: 8
   PRIMARY_PERCENTAGE: 40
   SECONDARY_PERCENTAGE: 35
-  STORE_REPO_NAME: ${{ github.event.inputs.results_repo_name }}
-  ACCOUNT2_REPO_OWNER: ${{ github.event.inputs.results_repo_owner }}
-  # Define Account 2/3 names if they are different for this workflow's workers
   ACCOUNT2_REPO_NAME: ${{ secrets.ACCOUNT2_REPO_NAME }}
   ACCOUNT3_REPO_OWNER: ${{ secrets.ACCOUNT3_REPO_OWNER }}
   ACCOUNT3_REPO_NAME: ${{ secrets.ACCOUNT3_REPO_NAME }}
@@ -38,17 +45,41 @@ jobs:
       total_chunks_count: ${{ steps.build_matrix.outputs.total_chunks }}
       chunk_package_artifact_name: "rustscan-chunks-package-${{ github.run_id }}"
     steps:
-      - name: Clone Results Repo and Extract IPs
+      - name: Checkout This Repository
+        uses: actions/checkout@v4
+
+      - name: Extract IPs from Input Source
         id: extract_ips
         env:
           STORE_RECON_PAT: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
+          MANUAL_FILE: ${{ github.event.inputs.manual_input_file }}
         run: |
-          git clone --depth 1 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.STORE_REPO_NAME }}.git" store-recon
-          find store-recon/results -type f -name "massdns.txt" -exec awk '{print $3}' {} + | sort -u > all_unique_ips.txt
-          if [ ! -s all_unique_ips.txt ]; then
-            echo "::warning:: No IPs found in results repo to scan."
-            touch all_unique_ips.txt
+          # --- CONDITIONAL LOGIC FOR INPUT SOURCE ---
+          if [[ -n "$MANUAL_FILE" ]]; then
+            echo "::notice:: Manual input mode enabled. Reading IPs from '$MANUAL_FILE'."
+            if [[ ! -f "$MANUAL_FILE" ]]; then
+              echo "::warning:: Manual input file '$MANUAL_FILE' not found. Proceeding with zero targets."
+              touch all_unique_ips.txt
+              exit 0
+            fi
+            # Extract 3rd column (IP) from the massdns-formatted file
+            awk '{print $3}' "$MANUAL_FILE" | sort -u > all_unique_ips.txt
+          else
+            echo "::notice:: Automated mode. Cloning results repo to find IPs."
+            if [[ -z "${{ env.ACCOUNT2_REPO_OWNER }}" || -z "${{ env.STORE_REPO_NAME }}" ]]; then
+                echo "::warning:: Automated mode requires results_repo_owner and results_repo_name inputs. Proceeding with zero targets."
+                touch all_unique_ips.txt
+                exit 0
+            fi
+            git clone --depth 1 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.STORE_REPO_NAME }}.git" store-recon
+            find store-recon/results -type f -name "massdns.txt" -exec awk '{print $3}' {} + | sort -u > all_unique_ips.txt
           fi
+
+          echo "INFO: Found $(wc -l < all_unique_ips.txt) unique IPs to scan."
+          if [ ! -s all_unique_ips.txt ]; then
+            echo "::warning:: No IPs found to scan. The workflow will finish without scanning."
+          fi
+
       - name: Build Matrix & Create IP Chunks
         id: build_matrix
         run: |
@@ -64,6 +95,7 @@ jobs:
           TOTAL_CHUNKS=$(echo "$JSON_MATRIX" | jq 'length')
           echo "full_matrix=${JSON_MATRIX}" >> $GITHUB_OUTPUT
           echo "total_chunks=${TOTAL_CHUNKS}" >> $GITHUB_OUTPUT
+          
       - name: Package IP Chunks and Upload
         if: steps.build_matrix.outputs.total_chunks > 0
         uses: actions/upload-artifact@v4
@@ -72,6 +104,7 @@ jobs:
           path: chunks/
           retention-days: 1
 
+  # This job does not need changes. It correctly distributes whatever chunks are created.
   distribute_and_trigger_scanners:
     name: Distribute & Trigger Scanners
     needs: prepare_rustscan_chunks
@@ -100,6 +133,7 @@ jobs:
           echo "primary_matrix=${PRIMARY_CHUNKS_JSON}" >> $GITHUB_OUTPUT
           echo "secondary_matrix=${SECONDARY_CHUNKS_JSON}" >> $GITHUB_OUTPUT
           echo "tertiary_matrix=${TERTIARY_CHUNKS_JSON}" >> $GITHUB_OUTPUT
+          
       - name: Trigger Secondary and Tertiary Scan Workflows
         # This step is identical to the first workflow's trigger, just point it to the correct worker workflow name
         uses: benc-uk/workflow-dispatch@v1
@@ -126,20 +160,35 @@ jobs:
         with:
           name: ${{ needs.prepare_rustscan_chunks.outputs.chunk_package_artifact_name }}
       - run: tar -xzvf *.tar.gz
-      - name: Clone Results Repo for IP-to-Subdomain Mapping
+      
+      - name: Clone Results Repo OR Use Manual File for IP-to-Subdomain Mapping
         env:
           STORE_RECON_PAT: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
+          MANUAL_FILE: ${{ github.event.inputs.manual_input_file }}
         run: |
-          git clone --depth 1 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.STORE_REPO_NAME }}.git" store-recon
-          # Create a single massdns file for easy searching
-          find store-recon/results -type f -name "massdns.txt" -exec cat {} + > full_massdns.txt
+          # --- CONDITIONAL LOGIC FOR MAPPING SOURCE ---
+          if [[ -n "$MANUAL_FILE" ]]; then
+            echo "::notice:: Manual mode. Using local file '$MANUAL_FILE' for IP-to-subdomain mapping."
+            if [[ -f "$MANUAL_FILE" ]]; then
+              cp "$MANUAL_FILE" full_massdns.txt
+            else
+              echo "::warning:: Manual input file '$MANUAL_FILE' not found. IP-to-subdomain mapping will be empty."
+              touch full_massdns.txt
+            fi
+          else
+            echo "::notice:: Automated mode. Cloning repo for IP-to-subdomain mapping."
+            git clone --depth 1 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.STORE_REPO_NAME }}.git" store-recon
+            # Create a single massdns file for easy searching
+            find store-recon/results -type f -name "massdns.txt" -exec cat {} + > full_massdns.txt
+          fi
+          
       - name: Map subdomains to ports (RustScan)
         id: map_subdomains_cdn
         run: |
           IP_CHUNK_FILE=${{ matrix.pair.chunk }}
           PORTS="80,443,8080,8443,3000,8000" # Using a smaller, more common port list for speed
           # Build a map of IP -> Subdomain for only the IPs in this chunk
-          grep -F -f "$IP_CHUNK_FILE" full_massdns.txt | awk '{ print $3, $1 }' | sort -k1,1 > ip_to_sub.txt || true
+          grep -F -f "$IP_CHUNK_FILE" full_massdns.txt | awk '{ print $3, $1 }' | sort -k1,1 > ip_to_sub.txt
           # Filter non-CDN IPs
           cat "$IP_CHUNK_FILE" | cut-cdn -ua -t 50 -silent -o non_cdn_ips.txt
           # Run RustScan on non-CDN IPs
@@ -148,6 +197,7 @@ jobs:
           awk -F ' -> ' '{ gsub(/[\[\]]/, "", $2); n = split($2, p, ","); for(i=1;i<=n;i++) print $1 ":" p[i] }' rustscan_results.txt > rustscan_ip_ports.txt
           # Join results back to get subdomains
           awk -F: 'NF==2{print $1, $2} NF==1{print $1, ""}' rustscan_ip_ports.txt | sort -k1,1 | join - ip_to_sub.txt | awk '{print $3 ":" $2}' > subdomain_ports.txt
+          
       - name: Sort Port Scan Results
         run: |
           mkdir -p results
@@ -159,6 +209,7 @@ jobs:
             mkdir -p "results/$parent"
             echo "$line" >> "results/$parent/subdomain_ports.txt"
           done < subdomain_ports.txt
+          
       - name: Upload Primary Account Scan Results
         uses: actions/upload-artifact@v4
         with:
@@ -179,6 +230,7 @@ jobs:
           pattern: 'rustscan-results-*'
           path: temp-aggregated-results
           merge-multiple: true
+          
       - name: Consolidate all scan results
         id: consolidate
         run: |
@@ -187,8 +239,10 @@ jobs:
           find temp-aggregated-results -type f -name "subdomain_ports.txt" | while read -r f; do D=$(basename "$(dirname "$f")"); mkdir -p "final_results/$D"; cat "$f" >> "final_results/$D/subdomain_ports.txt"; done
           find final_results -type f -name "*.txt" -exec sort -u -o {} {} \;
           if [ -z "$(ls -A final_results)" ]; then echo "has_results=false" >> $GITHUB_OUTPUT; else echo "has_results=true" >> $GITHUB_OUTPUT; fi
+     
       - name: Organize and Push Port Results
-        if: steps.consolidate.outputs.has_results == 'true'
+        # This step will only run in automated mode to prevent accidental commits from a manual test.
+        if: success() && steps.consolidate.outputs.has_results == 'true' && github.event.inputs.manual_input_file == ''
         env:
           STORE_RECON_PAT: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
           CORRELATION_ID: ${{ github.event.inputs.correlation_id }}
@@ -207,8 +261,10 @@ jobs:
           git add results/
           git commit -m "feat: Add port scan results from scan ID: ${CORRELATION_ID}"
           git push
+          
       - name: Trigger http multiple three
-        if: steps.consolidate.outputs.has_results == 'true'
+        # This step will also only run in automated mode.
+        if: success() && steps.consolidate.outputs.has_results == 'true' && github.event.inputs.manual_input_file == ''
         uses: benc-uk/workflow-dispatch@v1
         with:
           workflow: http_dispatch_three.yml

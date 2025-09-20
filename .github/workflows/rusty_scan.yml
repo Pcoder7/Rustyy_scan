@@ -360,7 +360,7 @@ jobs:
           retention-days: 1
 
   # REFACTORED JOB: This job now runs conditionally based on the merge job's output.
-  commit_scan_results:
+  commit_all_results:
     name: Commit Scan Results & Notify
     needs: merge_scan_results
     if: needs.merge_scan_results.outputs.has_results == 'true'
@@ -476,13 +476,19 @@ jobs:
             
             # Re-commit the newly calculated changes
             echo "Re-committing changes for retry attempt..."
-            git commit -m "feat: Add new assets from Recursive recon scan from Correlation ID: ${CORRELATION_ID} (retry)"
+            git commit -m "feat: Add Rusty scan results from Correlation ID: ${CORRELATION_ID} "
             sleep $(( 5 * i ))
           done
           echo "::error:: All $MAX_ATTEMPTS push attempts failed. The job will pass but the commit was NOT pushed."
           exit 0 
           
-      - name: Trigger http multiple three
+  trigger_http_multiple_three:
+    name: Trigger http multiple three
+    needs: [commit_all_results]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger next workflow
         uses: benc-uk/workflow-dispatch@v1
         with:
           workflow: http_dispatch_three.yml

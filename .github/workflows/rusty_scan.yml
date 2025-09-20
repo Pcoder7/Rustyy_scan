@@ -128,8 +128,16 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ${{ needs.prepare_rustscan_chunks.outputs.chunk_package_artifact_name }}
+
       - name: Extract Scan Package Archive
-        run: if [ -f *.tar.gz ]; then tar -xzvf *.tar.gz; else echo "::error:: Scan package not found!"; exit 1; fi
+        run: |
+          if [ -f *.tar.gz ]; then
+            tar -xzvf *.tar.gz
+            echo "✅ Successfully extracted chunks and mapping file."
+          else
+            echo "::error:: Scan package not found!"; exit 1
+          fi
+
       - name: Map Subdomains to Ports (Naabu + RustScan)
         run: |
           # ... This entire step is unchanged from the previous answer as its logic is now correct ...

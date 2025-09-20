@@ -286,37 +286,125 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - name: Download the single consolidated results artifact
         uses: actions/download-artifact@v4
         with:
           name: consolidated-scan-results
           path: final_results
+          
       - name: Organize and Push Port Results
-        if: github.event.inputs.manual_input_file == ''
         env:
           STORE_RECON_PAT: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
-          CORRELATION_ID: ${{ github.event.inputs.correlation_id }}
+          ACCOUNT2_USERNAME: ${{ secrets.ACCOUNT2_REPO_OWNER }}
+          CORRELATION_ID: ${{ github.run_id }}
         run: |
-          git config --global user.name "Recon Bot" && git config --global user.email "bot@github.com"
-          git clone "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.STORE_REPO_NAME }}.git" store-recon
-          cd store-recon
-          for domain_dir in ../final_results/*; do
-            domain_name=$(basename "$domain_dir")
-            dest_repo_dir="results/$domain_name" && mkdir -p "$dest_repo_dir"
-            if [ -f "$domain_dir/subdomain_ports.txt" ]; then
-              cat "$domain_dir/subdomain_ports.txt" "$dest_repo_dir/puredns_result.txt" 2>/dev/null | sort -u > "$dest_repo_dir/puredns_result.txt.tmp" && mv "$dest_repo_dir/puredns_result.txt.tmp" "$dest_repo_dir/puredns_result.txt"
+
+          RESULTS_DIR="${GITHUB_WORKSPACE}/final_results"
+          
+          if [ ! -d "$RESULTS_DIR" ] || [ -z "$(ls -A "$RESULTS_DIR")" ]; then
+            echo "::warning:: Results directory is empty or does not exist. Nothing to commit."
+            exit 0
+          fi
+          
+          echo "Cloning ${STORE} to commit results..."
+          git config --global user.name "Assetfinder Bot"
+          git config --global user.email "actions-bot@users.noreply.github.com"
+          
+          TMP_DIR="$(mktemp -d)"
+          if ! git clone "https://x-access-token:${STORE_RECON_PAT}@github.com/${ACCOUNT2_USERNAME}/${STORE}.git" "$TMP_DIR"; then
+            echo "::error:: Failed to clone the repository. Aborting the commit process."
+            exit 0 # Exit successfully as requested
+          fi
+          cd "$TMP_DIR" 
+          
+          # --- Reusable function to merge artifact data ---
+          run_merge() {
+          
+            echo "Merging new consolidated results into the repository..."
+            
+            for domain_dir in "${RESULTS_DIR}"/*; do
+              if [ ! -d "$domain_dir" ]; then continue; fi
+              domain_name=$(basename "$domain_dir")
+              dest_repo_dir="results/$domain_name"
+              mkdir -p "$dest_repo_dir"           
+             
+              source_ports_file="$domain_dir/subdomain_ports.txt"
+              dest_puredns_file="$dest_repo_dir/puredns_result.txt"
+              if [ -s "$source_ports_file" ]; then
+                <"$source_ports_file" tr -d '\0' \
+                  | grep '[[:alnum:]]' \
+                  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+                  | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[m|K]//g" \
+                  > "$source_ports_file.tmp" && mv "$source_ports_file.tmp" "$source_ports_file"
+                echo "  -> Merging port data into '$dest_puredns_file'"
+                temp_merged_file_2=$(mktemp)
+                if [ -f "$dest_puredns_file" ]; then cat "$source_ports_file" "$dest_puredns_file" | sort -u > "$temp_merged_file_2"; else sort -u "$source_ports_file" > "$temp_merged_file_2"; fi
+                mv "$temp_merged_file_2" "$dest_puredns_file"
+              fi
+            done
+            
+            # Stage all changes within the results directory
+            git add results/
+          }
+
+          run_merge
+          if git diff --cached --quiet; then
+            echo "No new unique data to commit in ${STORE}."
+            exit 0
+          fi
+          
+          # 2. Commit the changes locally
+          echo "Committing changes locally..."
+          git commit -m "feat: Rustyy scan results from Correlation ID: ${CORRELATION_ID}"
+          
+          # 3. Loop to sync and push the commit, with a robust retry mechanism
+          MAX_ATTEMPTS=10
+          for (( i=1; i<=MAX_ATTEMPTS; i++ )); do
+            echo "[Attempt $i/$MAX_ATTEMPTS] Pushing changes..."
+            
+            # Optimistic push first
+            if git push -v origin main; then
+              echo "✅ Successfully pushed new consolidated results to ${STORE} on attempt $i."
+              exit 0
             fi
+            
+            echo "::warning:: Push failed on attempt $i. Fetching latest changes from remote and re-applying local changes."
+            
+            # If push failed, fetch the latest state from the remote
+            git fetch origin main
+            if [ $? -ne 0 ]; then
+                echo "::error:: Git fetch failed. Cannot safely retry."
+                sleep $(( 5 * i ))
+                continue # Try again
+            fi
+            
+            # Reset local state to match remote, discarding the old local commit
+            git reset --hard origin/main
+            
+            # Re-run the merge logic on top of the fresh, updated branch
+            echo "Re-applying merge logic on top of the updated main branch..."
+            run_merge
+            
+            # Check if there are still changes to commit after the re-merge
+            if git diff --cached --quiet; then
+              echo "No net new changes to commit after syncing with remote. Another run may have already pushed these results."
+              exit 0
+            fi
+            
+            # Re-commit the newly calculated changes
+            echo "Re-committing changes for retry attempt..."
+            git commit -m "feat: Add new assets from Recursive recon scan from Correlation ID: ${CORRELATION_ID} (retry)"
+            sleep $(( 5 * i ))
           done
-          if git diff --quiet; then echo "No port scan changes to commit."; exit 0; fi
-          git add results/
-          git commit -m "feat: Add port scan results from scan ID: ${CORRELATION_ID}"
-          git push
+          echo "::error:: All $MAX_ATTEMPTS push attempts failed. The job will pass but the commit was NOT pushed."
+          exit 0 
+          
       - name: Trigger http multiple three
-        if: github.event.inputs.manual_input_file == ''
         uses: benc-uk/workflow-dispatch@v1
         with:
           workflow: http_dispatch_three.yml
           repo: Pcoder7/http-multiple-three
           token: ${{ secrets.PAT_TOKEN }}
           ref: main
-          inputs: '{ "run_id": "${{ github.event.inputs.correlation_id }}", "results_repo": "${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.STORE_REPO_NAME }}" }'
+          inputs: '{ "run_id": "${{ github.run_id }}", "results_repo": "${{ github.repository }}" }'

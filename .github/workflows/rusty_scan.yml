@@ -25,7 +25,7 @@ env:
   STORE_REPO_NAME: ${{ github.event.inputs.results_repo_name || secrets.STORE }}
   ACCOUNT2_REPO_OWNER: ${{ github.event.inputs.results_repo_owner || secrets.ACCOUNT2_REPO_OWNER }}
   DISTRIBUTION_THRESHOLD: 8
-  PRIMARY_PERCENTAGE: 40
+  PRIMARY_PERCENTAGE: 50
   SECONDARY_PERCENTAGE: 35
   ACCOUNT2_REPO_NAME: ${{ secrets.ACCOUNT2_REPO_NAME }}
   ACCOUNT3_REPO_OWNER: ${{ secrets.ACCOUNT3_REPO_OWNER }}
@@ -65,7 +65,7 @@ jobs:
           JSON_MATRIX='[]'
           if [ -s all_unique_ips.txt ]; then
             mkdir -p chunks/ip-lists
-            split -l 200 -a 4 --numeric-suffixes=1 all_unique_ips.txt "chunks/ip-lists/chunk_"
+            split -l 20 -a 4 --numeric-suffixes=1 all_unique_ips.txt "chunks/ip-lists/chunk_"
             while IFS= read -r chunk_file_path; do
               JSON_MATRIX=$(printf '%s' "$JSON_MATRIX" | jq -c --arg c "$chunk_file_path" '. + [{chunk:$c}]')
             done < <(find "chunks/ip-lists/" -name 'chunk_*' -type f)

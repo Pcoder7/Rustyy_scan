@@ -1,4 +1,3 @@
-# .github/workflows/rustscan-distributed.yml
 name: Distributed Port Scanning (RustScan)
 
 on:

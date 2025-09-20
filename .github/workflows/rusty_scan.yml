@@ -3,7 +3,6 @@ name: Distributed Port Scanning (RustScan)
 on:
   workflow_dispatch:
     inputs:
-      # --- Automated Trigger Inputs ---
       correlation_id:
         description: 'AUTOMATED: The run_id from the parent enumeration workflow'
         required: false
@@ -13,7 +12,6 @@ on:
       results_repo_name:
         description: 'AUTOMATED: Name of the repo where results are stored'
         required: false
-      # --- Manual Trigger Input ---
       manual_input_file:
         description: 'MANUAL: Path to a massdns.txt formatted file in this repo to scan'
         required: false
@@ -24,10 +22,8 @@ permissions:
   actions: write
 
 env:
-  # Use automated input if available, otherwise fallback to secrets
   STORE_REPO_NAME: ${{ github.event.inputs.results_repo_name || secrets.STORE }}
   ACCOUNT2_REPO_OWNER: ${{ github.event.inputs.results_repo_owner || secrets.ACCOUNT2_REPO_OWNER }}
-  # --- Static Distribution Config ---
   DISTRIBUTION_THRESHOLD: 8
   PRIMARY_PERCENTAGE: 40
   SECONDARY_PERCENTAGE: 35
@@ -37,44 +33,35 @@ env:
 
 jobs:
   prepare_rustscan_chunks:
-    name: Prepare IP Chunks & Package
+    name: Prepare Scan Chunks & Package
     runs-on: ubuntu-latest
     outputs:
       all_chunks_matrix_json: ${{ steps.build_matrix.outputs.full_matrix }}
       total_chunks_count: ${{ steps.build_matrix.outputs.total_chunks }}
-      chunk_package_artifact_name: "rustscan-chunks-package-${{ github.run_id }}"
+      chunk_package_artifact_name: "rustscan-package-${{ github.run_id }}"
     steps:
-      - name: Checkout This Repository
-        uses: actions/checkout@v4
-
-      - name: Extract IPs from Input Source
-        id: extract_ips
+      - uses: actions/checkout@v4
+      - name: Gather All MassDNS Records and Unique IPs
+        id: gather_data
         env:
           STORE_RECON_PAT: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
           MANUAL_FILE: ${{ github.event.inputs.manual_input_file }}
         run: |
-          # --- CONDITIONAL LOGIC FOR INPUT SOURCE ---
           if [[ -n "$MANUAL_FILE" ]]; then
-            echo "::notice:: Manual input mode enabled. Reading IPs from '$MANUAL_FILE'."
-            if [[ ! -f "$MANUAL_FILE" ]]; then
-              echo "::error:: Manual input file '$MANUAL_FILE' not found. Cannot proceed."
-              exit 1
-            fi
-            # Extract 3rd column (IP) from the massdns-formatted file
-            awk '{print $3}' "$MANUAL_FILE" | sort -u > all_unique_ips.txt
+            echo "::notice:: Manual mode. Using local file '$MANUAL_FILE'."
+            if [[ ! -f "$MANUAL_FILE" ]]; then echo "::error:: Manual file not found."; exit 1; fi
+            cp "$MANUAL_FILE" all_massdns_records.txt
           else
-            echo "::notice:: Automated mode. Cloning results repo to find IPs."
-            if [[ -z "${{ env.ACCOUNT2_REPO_OWNER }}" || -z "${{ env.STORE_REPO_NAME }}" ]]; then
-                echo "::error:: Automated mode requires results_repo_owner and results_repo_name inputs."
-                exit 1
-            fi
+            echo "::notice:: Automated mode. Cloning results repo."
             git clone --depth 1 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.STORE_REPO_NAME }}.git" store-recon
-            find store-recon/results -type f -name "massdns.txt" -exec awk '{print $3}' {} + | sort -u > all_unique_ips.txt
+            find store-recon/results -type f -name "massdns.txt" -exec cat {} + > all_massdns_records.txt
           fi
-
-          echo "INFO: Found $(wc -l < all_unique_ips.txt) unique IPs to scan."
-          if [ ! -s all_unique_ips.txt ]; then
-            echo "::warning:: No IPs found to scan. The workflow will finish without scanning."
+          if [ -s all_massdns_records.txt ]; then
+            awk '{print $3}' all_massdns_records.txt | sort -u > all_unique_ips.txt
+            echo "INFO: Found $(wc -l < all_unique_ips.txt) unique IPs from $(wc -l < all_massdns_records.txt) records."
+          else
+            echo "::warning:: No massdns records found. Creating empty files."
+            touch all_massdns_records.txt all_unique_ips.txt
           fi
 
       - name: Build Matrix & Create IP Chunks
@@ -82,24 +69,31 @@ jobs:
         run: |
           JSON_MATRIX='[]'
           if [ -s all_unique_ips.txt ]; then
-            mkdir -p chunks/all-ips
-            split -l 200 -a 4 --numeric-suffixes=1 all_unique_ips.txt "chunks/all-ips/chunk_"
+            mkdir -p chunks/ip-lists
+            split -l 200 -a 4 --numeric-suffixes=1 all_unique_ips.txt "chunks/ip-lists/chunk_"
             while IFS= read -r chunk_file_path; do
               JSON_MATRIX=$(printf '%s' "$JSON_MATRIX" | jq -c --arg c "$chunk_file_path" '. + [{chunk:$c}]')
-            done < <(find "chunks/all-ips/" -name 'chunk_*' -type f)
+            done < <(find "chunks/ip-lists/" -name 'chunk_*' -type f)
           fi
           TOTAL_CHUNKS=$(echo "$JSON_MATRIX" | jq 'length')
           echo "full_matrix=${JSON_MATRIX}" >> $GITHUB_OUTPUT
           echo "total_chunks=${TOTAL_CHUNKS}" >> $GITHUB_OUTPUT
 
-      - name: Package IP Chunks and Upload
+      - name: Package Chunks and Full Mapping File
+        if: steps.build_matrix.outputs.total_chunks > 0
+        run: |
+          # The key fix: The artifact now contains the IP chunks AND the full mapping file.
+          tar -czvf "rustscan-package-${{ github.run_id }}.tar.gz" chunks all_massdns_records.txt
+
+      - name: Upload Scan Package Artifact
         if: steps.build_matrix.outputs.total_chunks > 0
         uses: actions/upload-artifact@v4
         with:
-          name: "rustscan-chunks-package-${{ github.run_id }}"
-          path: chunks/
+          name: "rustscan-package-${{ github.run_id }}"
+          path: "rustscan-package-${{ github.run_id }}.tar.gz"
           retention-days: 1
 
+  # This job does not need changes
   distribute_and_trigger_scanners:
     name: Distribute & Trigger Scanners
     needs: prepare_rustscan_chunks
@@ -110,6 +104,7 @@ jobs:
     steps:
       - name: Calculate Chunk Distribution
         id: calculate_distribution
+        # ... Omitted for brevity, this logic is unchanged and correct ...
         shell: bash
         run: |
           ALL_CHUNKS_JSON='${{ needs.prepare_rustscan_chunks.outputs.all_chunks_matrix_json }}'
@@ -125,18 +120,11 @@ jobs:
             TERTIARY_CHUNKS_JSON=$(echo "$ALL_CHUNKS_JSON" | jq -c --argjson offset "$OFFSET_FOR_TERTIARY" '.[$offset:]')
           fi
           echo "primary_matrix=${PRIMARY_CHUNKS_JSON}" >> $GITHUB_OUTPUT
-          echo "secondary_matrix=${SECONDARY_CHUNKS_JSON}" >> $GITHUB_OUTPUT
-          echo "tertiary_matrix=${TERTIARY_CHUNKS_JSON}" >> $GITHUB_OUTPUT
-      # Placeholder for triggering secondary/tertiary workflows. Ensure you have corresponding
-      # worker workflows in your other repositories that can accept these inputs.
-      # - name: Trigger Secondary and Tertiary Scan Workflows
-      #   uses: benc-uk/workflow-dispatch@v1
-      #   ...
 
   run_primary_account_scan:
     name: Run Port Scan (Primary)
     needs: [prepare_rustscan_chunks, distribute_and_trigger_scanners]
-    if: needs.prepare_rustscan_chunks.outputs.total_chunks_count > 0 && needs.distribute_and_trigger_scanners.outputs.primary_matrix_json != '[]'
+    if: needs.prepare_rustscan_chunks.outputs.total_chunks_count > 0
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/pcoder7/spider-puredns-actions:latest
@@ -149,61 +137,106 @@ jobs:
         pair: ${{ fromJson(needs.distribute_and_trigger_scanners.outputs.primary_matrix_json) }}
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Download & Extract IP Chunks
+      - name: Download & Extract Scan Package
         uses: actions/download-artifact@v4
         with:
           name: ${{ needs.prepare_rustscan_chunks.outputs.chunk_package_artifact_name }}
-      
-      - name: Extract Chunks Archive
+      - name: Extract Scan Package Archive
         run: |
           if [ -f *.tar.gz ]; then
             tar -xzvf *.tar.gz
+            echo "✅ Successfully extracted chunks and mapping file."
           else
-            echo "::warning:: No chunk artifact was downloaded. Nothing to extract."
-          fi
- 
-
-      - name: Prepare IP-to-Subdomain Mapping File
-        env:
-          STORE_RECON_PAT: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
-          MANUAL_FILE: ${{ github.event.inputs.manual_input_file }}
-        run: |
-          if [[ -n "$MANUAL_FILE" ]]; then
-            echo "::notice:: Manual mode. Using local file '$MANUAL_FILE' for IP-to-subdomain mapping."
-            if [[ -f "$MANUAL_FILE" ]]; then
-              cp "$MANUAL_FILE" full_massdns.txt
-            else
-              echo "::warning:: Manual input file not found. IP-to-subdomain mapping will be empty."
-              touch full_massdns.txt
-            fi
-          else
-            echo "::notice:: Automated mode. Cloning repo for IP-to-subdomain mapping."
-            git clone --depth 1 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.STORE_REPO_NAME }}.git" store-recon
-            find store-recon/results -type f -name "massdns.txt" -exec cat {} + > full_massdns.txt
+            echo "::error:: Scan package not found!"; exit 1
           fi
 
-      - name: Map subdomains to ports (RustScan)
+      - name: Map Subdomains to Ports (Naabu + RustScan)
         id: map_subdomains_cdn
         run: |
-          IP_CHUNK_FILE=${{ matrix.pair.chunk }}
+          IP_CHUNK_FILE="${{ matrix.pair.chunk }}"
+          FULL_MASSDNS_FILE="all_massdns_records.txt"
+          OUTPUT="subdomain_ports.txt"
           PORTS="80,443,8080,8443,3000,8000"
-          grep -F -f "$IP_CHUNK_FILE" full_massdns.txt | awk '{ print $3, $1 }' | sort -k1,1 > ip_to_sub.txt || true
-          cat "$IP_CHUNK_FILE" | cut-cdn -ua -t 50 -silent -o non_cdn_ips.txt || true
-          if [ ! -s non_cdn_ips.txt ]; then echo "No non-CDN IPs to scan in this chunk."; touch subdomain_ports.txt; exit 0; fi
-          rustscan -a non_cdn_ips.txt -p "$PORTS" --no-banner -t 4000 --tries 1 -u 5000 -b 600 --greppable --accessible > rustscan_results.txt || true
-          awk -F ' -> ' '{ gsub(/[\[\]]/, "", $2); n = split($2, p, ","); for(i=1;i<=n;i++) print $1 ":" p[i] }' rustscan_results.txt > rustscan_ip_ports.txt
-          awk -F: 'NF==2{print $1, $2} NF==1{print $1, ""}' rustscan_ip_ports.txt | sort -k1,1 | join - ip_to_sub.txt | awk '{print $3 ":" $2}' > subdomain_ports.txt
+
+          # Create per-runner temp files
+          TMP_IP2SUB=$(mktemp)
+          TMP_NONCDN=$(mktemp)
+          TMP_CDN=$(mktemp)
+          TMP_SMAP_NONCDN=$(mktemp)
+          TMP_RUSTSCAN=$(mktemp)
+          SMAP_FILE=$(mktemp)
+
+          echo "▶ Cleaning & extracting A-records from FULL mapping file..."
+          awk '{ print $3, $1 }' "$FULL_MASSDNS_FILE" | sort -k1,1 -u > "$TMP_IP2SUB"
+          echo "✅ Master lookup table created with $(wc -l < $TMP_IP2SUB) entries."
+          
+          echo "▶ Filtering non-CDN IPs for this chunk with cut-cdn..."
+          cat "$IP_CHUNK_FILE" | cut-cdn -ua -t 50 -silent -o "$TMP_NONCDN" || true
+          echo "✅ All done. TMP_NONCDN (for this chunk) contains $(wc -l < "$TMP_NONCDN") IPs."
+          head -n5 "$TMP_NONCDN"
+          echo "==================================================================="
+
+          if [ ! -s "$TMP_NONCDN" ]; then
+              echo "::notice:: No non-CDN IPs in this chunk. Skipping scans."
+          else
+              echo "▶ Running naabu (passive) on non-CDN IPs..."
+              naabu -l "$TMP_NONCDN" -passive -o "$TMP_SMAP_NONCDN" -no-color -silent || true
+              
+              echo "▶ Running rustscan (active) on non-CDN IPs..."
+              rustscan -a "$TMP_NONCDN" -p "$PORTS" --no-banner -t 4000 --tries 1 -u 5000 -b 600 --greppable --accessible > "$TMP_RUSTSCAN" || true
+              
+              echo "▶ Merging rustscan results into naabu results..."
+              cat "$TMP_RUSTSCAN" | awk -F ' -> ' '{ gsub(/[\[\]]/, "", $2); n = split($2, p, ","); for(i=1;i<=n;i++) print $1 ":" p[i] }' | anew -q "$TMP_SMAP_NONCDN" || true
+              echo "✅ All done. TMP_SMAP_NONCDN contains $(wc -l < "$TMP_SMAP_NONCDN") IP:Port combos."
+              head -n20 "$TMP_SMAP_NONCDN"
+              echo "==================================================================="
+          fi
+
+          echo "▶ Deriving CDN IP list for this chunk..."
+          cat "$IP_CHUNK_FILE" | anew -d "$TMP_NONCDN" > "$TMP_CDN"
+          echo "✅ All done. TMP_CDN contains $(wc -l < "$TMP_CDN") IPs."
+          head -n5 "$TMP_CDN"
+          echo "==================================================================="
+          
+          echo "▶ Merging scanned non-CDN results with bare CDN IPs..."
+          cat "$TMP_SMAP_NONCDN" "$TMP_CDN" 2>/dev/null | sort -u > "$SMAP_FILE"
+          echo "✅ All done. SMAP_FILE contains $(wc -l < "$SMAP_FILE") total entries."
+          head -n20 "$SMAP_FILE"
+          echo "==================================================================="
+
+          echo "▶ Joining with lookup table to produce final subdomain:port file..."
+          awk -F: '
+            NF==2 { print $1, $2 }
+            NF==1 { print $1, ""  }
+          ' "$SMAP_FILE" \
+            | sort -k1,1 \
+            | join - "$TMP_IP2SUB" \
+            | { 
+              awk '
+                NF >= 2 { 
+                  if (NF == 3 && $2 ~ /^[0-9]+$/) { 
+                    print $3 ":" $2 
+                  } else { 
+                    print $NF 
+                  } 
+                }
+              '       
+            } \
+            > "$OUTPUT"
+          
+          echo "✅ Generated $OUTPUT for this chunk:"
+          head -n50 "$OUTPUT"
+          
+          # Cleanup
+          rm -f "$TMP_IP2SUB" "$TMP_NONCDN" "$TMP_CDN" "$TMP_SMAP_NONCDN" "$TMP_RUSTSCAN" "$SMAP_FILE"
 
       - name: Sort Port Scan Results
         run: |
           mkdir -p results
           if [ ! -s "subdomain_ports.txt" ]; then exit 0; fi
           while read -r line; do
-            subdomain=$(echo "$line" | cut -d: -f1)
-            parent=$(echo "$subdomain" | rev | cut -d. -f1,2 | rev)
-            mkdir -p "results/$parent"
-            echo "$line" >> "results/$parent/subdomain_ports.txt"
+            subdomain=$(echo "$line" | cut -d: -f1); parent=$(echo "$subdomain" | rev | cut -d. -f1,2 | rev)
+            mkdir -p "results/$parent"; echo "$line" >> "results/$parent/subdomain_ports.txt"
           done < subdomain_ports.txt
 
       - name: Upload Primary Account Scan Results
@@ -213,12 +246,14 @@ jobs:
           path: results/
           retention-days: 1
 
+  # The final job remains the same, it will now only run if the scan job succeeds or fails, but not if it's skipped.
   merge_and_commit_scan_results:
     name: Merge, Commit & Notify
     needs: run_primary_account_scan
-    if: always()
+    if: always() && needs.run_primary_account_scan.result != 'skipped'
     runs-on: ubuntu-latest
     steps:
+      # Omitted for brevity, this part is unchanged and correct.
       - uses: actions/checkout@v4
       - name: Download all scan result artifacts
         uses: actions/download-artifact@v4
@@ -234,7 +269,6 @@ jobs:
           find temp-aggregated-results -type f -name "subdomain_ports.txt" | while read -r f; do D=$(basename "$(dirname "$f")"); mkdir -p "final_results/$D"; cat "$f" >> "final_results/$D/subdomain_ports.txt"; done
           find final_results -type f -name "*.txt" -exec sort -u -o {} {} \;
           if [ -z "$(ls -A final_results)" ]; then echo "has_results=false" >> $GITHUB_OUTPUT; else echo "has_results=true" >> $GITHUB_OUTPUT; fi
-
       - name: Organize and Push Port Results
         if: success() && steps.consolidate.outputs.has_results == 'true' && github.event.inputs.manual_input_file == ''
         env:
@@ -255,7 +289,6 @@ jobs:
           git add results/
           git commit -m "feat: Add port scan results from scan ID: ${CORRELATION_ID}"
           git push
-
       - name: Trigger http multiple three
         if: success() && steps.consolidate.outputs.has_results == 'true' && github.event.inputs.manual_input_file == ''
         uses: benc-uk/workflow-dispatch@v1

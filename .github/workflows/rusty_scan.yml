@@ -149,11 +149,20 @@ jobs:
         pair: ${{ fromJson(needs.distribute_and_trigger_scanners.outputs.primary_matrix_json) }}
     steps:
       - uses: actions/checkout@v4
+      
       - name: Download & Extract IP Chunks
         uses: actions/download-artifact@v4
         with:
           name: ${{ needs.prepare_rustscan_chunks.outputs.chunk_package_artifact_name }}
-      - run: tar -xzvf *.tar.gz
+      
+      - name: Extract Chunks Archive
+        run: |
+          if [ -f *.tar.gz ]; then
+            tar -xzvf *.tar.gz
+          else
+            echo "::warning:: No chunk artifact was downloaded. Nothing to extract."
+          fi
+ 
 
       - name: Prepare IP-to-Subdomain Mapping File
         env:

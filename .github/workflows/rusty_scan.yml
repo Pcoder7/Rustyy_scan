@@ -86,7 +86,7 @@ jobs:
           path: "rustscan-package-${{ github.run_id }}.tar.gz"
           retention-days: 1
 
-distribute_and_trigger_scanners:
+  distribute_and_trigger_scanners:
     name: Distribute Work & Trigger Scanners
     needs: prepare_rustscan_chunks
     if: needs.prepare_rustscan_chunks.outputs.total_chunks_count > 0
@@ -189,7 +189,7 @@ distribute_and_trigger_scanners:
           inputs: ${{ steps.prepare_payload_tertiary.outputs.json_string }}
           ref: main
 
-run_primary_account_scan:
+  run_primary_account_scan:
     name: Run Port Scan (Primary)
     needs: [prepare_rustscan_chunks, distribute_and_trigger_scanners]
     if: needs.prepare_rustscan_chunks.outputs.total_chunks_count > 0
@@ -314,7 +314,7 @@ run_primary_account_scan:
           path: results/
           retention-days: 1
 
-  # REFACTORED JOB: This job now only merges and checks results, passing its finding to the next job.
+  
   merge_scan_results:
     name: Merge All Distributed Scan Results
     needs: run_primary_account_scan

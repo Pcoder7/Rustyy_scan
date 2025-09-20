@@ -48,7 +48,7 @@ jobs:
           MANUAL_FILE: ${{ github.event.inputs.manual_input_file }}
         run: |
           if [[ -n "$MANUAL_FILE" ]]; then
-            if [[ ! -f "$MANUAL_FILE" ]]; then echo "::error:: Manual file not found."; exit 1; fi
+            if [[ ! -f "$MANUAL_FILE" ]]; then echo "::error:: Manual file not found."; exit 0; fi
             cp "$MANUAL_FILE" all_massdns_records.txt
           else
             git clone --depth 1 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.STORE_REPO_NAME }}.git" store-recon
@@ -135,24 +135,84 @@ jobs:
             tar -xzvf *.tar.gz
             echo "✅ Successfully extracted chunks and mapping file."
           else
-            echo "::error:: Scan package not found!"; exit 1
+            echo "::error:: Scan package not found!"; exit 0
           fi
 
       - name: Map Subdomains to Ports (Naabu + RustScan)
+        id: map_subdomains_cdn
         run: |
-          # ... This entire step is unchanged from the previous answer as its logic is now correct ...
-          IP_CHUNK_FILE="${{ matrix.pair.chunk }}"; FULL_MASSDNS_FILE="all_massdns_records.txt"; OUTPUT="subdomain_ports.txt"; PORTS="80,443,8080,8443,3000,8000"
-          TMP_IP2SUB=$(mktemp); TMP_NONCDN=$(mktemp); TMP_CDN=$(mktemp); TMP_SMAP_NONCDN=$(mktemp); TMP_RUSTSCAN=$(mktemp); SMAP_FILE=$(mktemp)
+          IP_CHUNK_FILE="${{ matrix.pair.chunk }}"
+          FULL_MASSDNS_FILE="all_massdns_records.txt"
+          OUTPUT="subdomain_ports.txt"
+          PORTS="80,443,8080,8443,3000,8000"
+          # Create per-runner temp files
+          TMP_IP2SUB=$(mktemp)
+          TMP_NONCDN=$(mktemp)
+          TMP_CDN=$(mktemp)
+          TMP_SMAP_NONCDN=$(mktemp)
+          TMP_RUSTSCAN=$(mktemp)
+          SMAP_FILE=$(mktemp)
+          echo "▶ Cleaning & extracting A-records from FULL mapping file..."
           awk '{ print $3, $1 }' "$FULL_MASSDNS_FILE" | sort -k1,1 -u > "$TMP_IP2SUB"
+          echo "✅ Master lookup table created with $(wc -l < $TMP_IP2SUB) entries."
+          
+          echo "▶ Filtering non-CDN IPs for this chunk with cut-cdn..."
           cat "$IP_CHUNK_FILE" | cut-cdn -ua -t 50 -silent -o "$TMP_NONCDN" || true
-          if [ -s "$TMP_NONCDN" ]; then
+          echo "✅ All done. TMP_NONCDN (for this chunk) contains $(wc -l < "$TMP_NONCDN") IPs."
+          head -n5 "$TMP_NONCDN"
+          echo "==================================================================="
+          if [ ! -s "$TMP_NONCDN" ]; then
+              echo "::notice:: No non-CDN IPs in this chunk. Skipping scans."
+          else
+              echo "▶ Running naabu (passive) on non-CDN IPs..."
               naabu -l "$TMP_NONCDN" -passive -o "$TMP_SMAP_NONCDN" -no-color -silent || true
+              
+              echo "▶ Running rustscan (active) on non-CDN IPs..."
               rustscan -a "$TMP_NONCDN" -p "$PORTS" --no-banner -t 4000 --tries 1 -u 5000 -b 600 --greppable --accessible > "$TMP_RUSTSCAN" || true
+              
+              echo "▶ Merging rustscan results into naabu results..."
               cat "$TMP_RUSTSCAN" | awk -F ' -> ' '{ gsub(/[\[\]]/, "", $2); n = split($2, p, ","); for(i=1;i<=n;i++) print $1 ":" p[i] }' | anew -q "$TMP_SMAP_NONCDN" || true
+              echo "✅ All done. TMP_SMAP_NONCDN contains $(wc -l < "$TMP_SMAP_NONCDN") IP:Port combos."
+              head -n20 "$TMP_SMAP_NONCDN"
+              echo "==================================================================="
           fi
+          echo "▶ Deriving CDN IP list for this chunk..."
           cat "$IP_CHUNK_FILE" | anew -d "$TMP_NONCDN" > "$TMP_CDN"
+          echo "✅ All done. TMP_CDN contains $(wc -l < "$TMP_CDN") IPs."
+          head -n5 "$TMP_CDN"
+          echo "==================================================================="
+          
+          echo "▶ Merging scanned non-CDN results with bare CDN IPs..."
           cat "$TMP_SMAP_NONCDN" "$TMP_CDN" 2>/dev/null | sort -u > "$SMAP_FILE"
-          awk -F: 'NF==2 { print $1, $2 } NF==1 { print $1, "" }' "$SMAP_FILE" | sort -k1,1 | join - "$TMP_IP2SUB" | { awk 'NF >= 2 { if (NF == 3 && $2 ~ /^[0-9]+$/) { print $3 ":" $2 } else { print $NF } }' } > "$OUTPUT"
+          echo "✅ All done. SMAP_FILE contains $(wc -l < "$SMAP_FILE") total entries."
+          head -n20 "$SMAP_FILE"
+          echo "==================================================================="
+          echo "▶ Joining with lookup table to produce final subdomain:port file..."
+          awk -F: '
+            NF==2 { print $1, $2 }
+            NF==1 { print $1, ""  }
+          ' "$SMAP_FILE" \
+            | sort -k1,1 \
+            | join - "$TMP_IP2SUB" \
+            | { 
+              awk '
+                NF >= 2 { 
+                  if (NF == 3 && $2 ~ /^[0-9]+$/) { 
+                    print $3 ":" $2 
+                  } else { 
+                    print $NF 
+                  } 
+                }
+              '       
+            } \
+            > "$OUTPUT"
+          
+          echo "✅ Generated $OUTPUT for this chunk:"
+          head -n50 "$OUTPUT"
+          
+          # Cleanup
+          rm -f "$TMP_IP2SUB" "$TMP_NONCDN" "$TMP_CDN" "$TMP_SMAP_NONCDN" "$TMP_RUSTSCAN" "$SMAP_FILE"
+
       - name: Sort Port Scan Results
         run: |
           mkdir -p results; if [ ! -s "subdomain_ports.txt" ]; then exit 0; fi

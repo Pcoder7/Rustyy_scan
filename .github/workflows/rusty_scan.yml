@@ -73,9 +73,11 @@ jobs:
           TOTAL_CHUNKS=$(echo "$JSON_MATRIX" | jq 'length')
           echo "full_matrix=${JSON_MATRIX}" >> $GITHUB_OUTPUT
           echo "total_chunks=${TOTAL_CHUNKS}" >> $GITHUB_OUTPUT
+          
       - name: Package Chunks and Full Mapping File
         if: steps.build_matrix.outputs.total_chunks > 0
         run: tar -czvf "rustscan-package-${{ github.run_id }}.tar.gz" chunks all_massdns_records.txt
+        
       - name: Upload Scan Package Artifact
         if: steps.build_matrix.outputs.total_chunks > 0
         uses: actions/upload-artifact@v4
@@ -148,6 +150,7 @@ distribute_and_trigger_scanners:
           token: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
           inputs: ${{ steps.prepare_payload_secondary.outputs.json_string }}
           ref: main
+      
       - name: Add Delay Between API Triggers for Tertiary Account
         if: steps.calculate_distribution.outputs.tertiary_matrix != '[]'
         run: |

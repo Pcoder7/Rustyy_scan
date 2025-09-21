@@ -44,6 +44,7 @@ jobs:
 
       - name: Gather MassDNS Records from Specified Input
         id: gather_data
+ 
         env:
           STORE_RECON_PAT: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
           MANUAL_FILE: ${{ github.event.inputs.manual_input_file }}
@@ -55,7 +56,7 @@ jobs:
           if [[ -n "$MANUAL_FILE" ]]; then
             echo "::notice:: Manual mode activated. Using local file: '$MANUAL_FILE'"
             # Checkout the current repo to access the manual file
-            actions/checkout@v4
+
             if [[ ! -f "$MANUAL_FILE" ]]; then
               echo "::error:: Manual input file '$MANUAL_FILE' not found."
               exit 1

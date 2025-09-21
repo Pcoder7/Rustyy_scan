@@ -41,31 +41,77 @@ jobs:
       chunk_package_artifact_name: "rustscan-package-${{ github.run_id }}"
     steps:
       - uses: actions/checkout@v4
-      - name: Gather All MassDNS Records and Unique IPs
+
+      - name: Gather MassDNS Records from Specified Input
         id: gather_data
         env:
           STORE_RECON_PAT: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
           MANUAL_FILE: ${{ github.event.inputs.manual_input_file }}
+          CORRELATION_ID: ${{ github.event.inputs.correlation_id }}
         run: |
+          # This block has three distinct modes: Manual, Correlated, or Failure.
+          
+          # --- MODE 1: Manual File Input (Highest Priority) ---
           if [[ -n "$MANUAL_FILE" ]]; then
-            if [[ ! -f "$MANUAL_FILE" ]]; then echo "::error:: Manual file not found."; exit 0; fi
+            echo "::notice:: Manual mode activated. Using local file: '$MANUAL_FILE'"
+            # Checkout the current repo to access the manual file
+            actions/checkout@v4
+            if [[ ! -f "$MANUAL_FILE" ]]; then
+              echo "::error:: Manual input file '$MANUAL_FILE' not found."
+              exit 1
+            fi
+            # Use the manual file as the source of truth
             cp "$MANUAL_FILE" all_massdns_records.txt
-          else
-            git clone --depth 1 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.STORE_REPO_NAME }}.git" store-recon
-            find store-recon/results -type f -name "massdns.txt" -exec cat {} + > all_massdns_records.txt
-          fi
+
+          # --- MODE 2: Correlation ID Input ---
+          elif [[ -n "$CORRELATION_ID" ]]; then
+            echo "::notice:: Correlated mode activated. Searching for commits with ID: '$CORRELATION_ID'"
+            # Checkout the store-recon repo with full history
+            git clone --depth=0 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ secrets.ACCOUNT2_REPO_OWNER }}/${{ secrets.STORE }}.git" store-recon
+            cd store-recon
+
+            FULL_PATTERN="feat: Add resolved subdomains from scan ID: ${CORRELATION_ID}"
+            TARGET_PATHSPEC="results/*/massdns.txt"
+            echo "-> Searching for commits with the exact pattern: '$FULL_PATTERN'"
+            
+            COMMIT_LIST=$(git log --no-merges --grep="$FULL_PATTERN" --format="%H" || true)
+            if [ -z "$COMMIT_LIST" ]; then
+              echo "::warning::No commits found for Correlation ID '$CORRELATION_ID'. No new IPs to scan."
+              touch ../all_massdns_records.txt # Create empty file outside the repo dir
+              exit 0
+            fi
+
+            LATEST_COMMIT=$(echo "$COMMIT_LIST" | head -n 1)
+            OLDEST_COMMIT=$(echo "$COMMIT_LIST" | tail -n 1)
+            echo "-> Found commit range to process: $OLDEST_COMMIT...$LATEST_COMMIT"
+
+            if git rev-parse --verify ${OLDEST_COMMIT}^ >/dev/null 2>&1; then
+              git diff "${OLDEST_COMMIT}^" "$LATEST_COMMIT" --unified=0 -- "$TARGET_PATHSPEC" > ../raw_diff.log || true
+            else
+              git show "$LATEST_COMMIT" --unified=0 -- "$TARGET_PATHSPEC" > ../raw_diff.log || true
+            fi
+            
+            # Filter the diff and place the result file outside the checked-out repo
+            grep '^\+' ../raw_diff.log | grep -vE '^\+\+\+' | sed 's/^+//' > ../all_massdns_records.txt || true
+            cd .. # Return to the main workspace directory
+
+          # --- Common Processing Logic (Runs for both Manual and Correlated modes) ---
           if [ -s all_massdns_records.txt ]; then
+            echo "✅ Successfully gathered $(wc -l < all_massdns_records.txt) massdns records."
             awk '{print $3}' all_massdns_records.txt | sort -u > all_unique_ips.txt
+            echo "✅ Extracted $(wc -l < all_unique_ips.txt) unique IPs for scanning."
           else
+            echo "::warning:: No massdns records were found or extracted. Workflow will finish."
             touch all_massdns_records.txt all_unique_ips.txt
           fi
+
       - name: Build Matrix & Create IP Chunks
         id: build_matrix
         run: |
           JSON_MATRIX='[]'
           if [ -s all_unique_ips.txt ]; then
             mkdir -p chunks/ip-lists
-            split -l 20 -a 4 --numeric-suffixes=1 all_unique_ips.txt "chunks/ip-lists/chunk_"
+            split -l 200 -a 4 --numeric-suffixes=1 all_unique_ips.txt "chunks/ip-lists/chunk_"
             while IFS= read -r chunk_file_path; do
               JSON_MATRIX=$(printf '%s' "$JSON_MATRIX" | jq -c --arg c "$chunk_file_path" '. + [{chunk:$c}]')
             done < <(find "chunks/ip-lists/" -name 'chunk_*' -type f)
@@ -77,7 +123,7 @@ jobs:
       - name: Package Chunks and Full Mapping File
         if: steps.build_matrix.outputs.total_chunks > 0
         run: tar -czvf "rustscan-package-${{ github.run_id }}.tar.gz" chunks all_massdns_records.txt
-        
+
       - name: Upload Scan Package Artifact
         if: steps.build_matrix.outputs.total_chunks > 0
         uses: actions/upload-artifact@v4
@@ -85,6 +131,7 @@ jobs:
           name: "rustscan-package-${{ github.run_id }}"
           path: "rustscan-package-${{ github.run_id }}.tar.gz"
           retention-days: 1
+        
 
   distribute_and_trigger_scanners:
     name: Distribute Work & Trigger Scanners

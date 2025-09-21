@@ -94,7 +94,12 @@ jobs:
             # Filter the diff and place the result file outside the checked-out repo
             grep '^\+' ../raw_diff.log | grep -vE '^\+\+\+' | sed 's/^+//' > ../all_massdns_records.txt || true
             cd .. # Return to the main workspace directory
-
+          
+          else
+            echo "::error:: No valid input provided. Must supply either 'manual_input_file' or 'correlation_id'."
+            exit 0
+          fi
+          
           # --- Common Processing Logic (Runs for both Manual and Correlated modes) ---
           if [ -s all_massdns_records.txt ]; then
             echo "✅ Successfully gathered $(wc -l < all_massdns_records.txt) massdns records."

@@ -41,10 +41,11 @@ jobs:
       chunk_package_artifact_name: "rustscan-package-${{ github.run_id }}"
     steps:
       - uses: actions/checkout@v4
-
+        with:
+         fetch-depth: 0
+         
       - name: Gather MassDNS Records from Specified Input
         id: gather_data
- 
         env:
           STORE_RECON_PAT: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
           MANUAL_FILE: ${{ github.event.inputs.manual_input_file }}

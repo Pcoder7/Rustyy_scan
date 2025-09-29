@@ -72,7 +72,7 @@ jobs:
             git clone --depth=1 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ secrets.ACCOUNT2_REPO_OWNER }}/${{ secrets.STORE }}.git" store-recon
             cd store-recon
 
-            FULL_PATTERN="feat: Add resolved subdomains from scan ID: ${CORRELATION_ID}"
+            FULL_PATTERN="feat: Add new assets from Recursive recon scan from Correlation ID: ${CORRELATION_ID}"
             TARGET_PATHSPEC="results/*/massdns.txt"
             echo "-> Searching for commits with the exact pattern: '$FULL_PATTERN'"
             

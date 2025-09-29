@@ -69,7 +69,7 @@ jobs:
           elif [[ -n "$CORRELATION_ID" ]]; then
             echo "::notice:: Correlated mode activated. Searching for commits with ID: '$CORRELATION_ID'"
             # Checkout the store-recon repo with full history
-            git clone --depth=0 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ secrets.ACCOUNT2_REPO_OWNER }}/${{ secrets.STORE }}.git" store-recon
+            git clone --depth=1 "https://x-access-token:${STORE_RECON_PAT}@github.com/${{ secrets.ACCOUNT2_REPO_OWNER }}/${{ secrets.STORE }}.git" store-recon
             cd store-recon
 
             FULL_PATTERN="feat: Add resolved subdomains from scan ID: ${CORRELATION_ID}"

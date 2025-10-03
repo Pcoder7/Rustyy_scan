@@ -322,32 +322,59 @@ jobs:
           echo "✅ All done. SMAP_FILE contains $(wc -l < "$SMAP_FILE") total entries."
           head -n20 "$SMAP_FILE"
           echo "==================================================================="
-          echo "▶ Joining with lookup table to produce final subdomain:port file..."
-          awk '
-          FNR==NR {
-            ip = $1
-            sub = ""
-            for (i = 2; i <= NF; i++) {
-              sub = (sub == "" ? $i : sub " " $i)
-            }
-            map[ip] = sub
-            next
-          }
+          echo "=== TMP_IP2SUB head ==="; sed -n '1,20p' "$TMP_IP2SUB"
+          echo "=== SMAP_FILE head ==="; sed -n '1,20p' "$SMAP_FILE"
+          echo "=== Show problematic IP lines in TMP_IP2SUB ==="
+          grep -n '^10\.97\.' "$TMP_IP2SUB" || true
           
-          {
-            line = $0
-            split(line, parts, ":")
-            ip = parts[1]
-            port = (length(parts) >= 2 ? parts[2] : "")
-            if (map[ip] != "") {
-              if (port != "") {
-                print map[ip] ":" port
-              } else {
-                print map[ip]
-              }
-            }
-          }
-          ' "$TMP_IP2SUB" "$SMAP_FILE" > "$OUTPUT"
+          echo "▶ Joining with lookup table to produce final subdomain:port file..."
+          # ---- replace join/awk block with this python implementation ----
+          python3 - "$TMP_IP2SUB" "$SMAP_FILE" "$OUTPUT" <<'PY'
+          import sys
+          
+          tmp_ip2sub = sys.argv[1]
+          smap_file = sys.argv[2]
+          output = sys.argv[3]
+          
+          # Build IP -> subdomain map
+          ip2sub = {}
+          with open(tmp_ip2sub, 'r', encoding='utf-8', errors='ignore') as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  parts = line.split()
+                  ip = parts[0]
+                  sub = " ".join(parts[1:]) if len(parts) > 1 else ""
+                  # preserve first mapping encountered (like sort -u before)
+                  if ip not in ip2sub:
+                      ip2sub[ip] = sub
+          
+          # Produce final output: subdomain[:port] or subdomain
+          with open(smap_file, 'r', encoding='utf-8', errors='ignore') as fin, \
+               open(output, 'w', encoding='utf-8') as fout:
+              for line in fin:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  if ':' in line:
+                      ip, port = line.split(':', 1)
+                      port = port.strip()
+                  else:
+                      ip = line
+                      port = ""
+                  sub = ip2sub.get(ip)
+                  if not sub:
+                      # if you want to debug missing IPs, uncomment next line:
+                      # print(f"::warning:: no mapping for {ip}", file=sys.stderr)
+                      continue
+                  if port:
+                      fout.write(f"{sub}:{port}\n")
+                  else:
+                      fout.write(f"{sub}\n")
+          PY
+          # ----------------------------------------------------------------
+
 
           
           echo "✅ Generated $OUTPUT for this chunk:"

@@ -323,24 +323,32 @@ jobs:
           head -n20 "$SMAP_FILE"
           echo "==================================================================="
           echo "▶ Joining with lookup table to produce final subdomain:port file..."
-          awk -F: '
-            NF==2 { print $1, $2 }
-            NF==1 { print $1, ""  }
-          ' "$SMAP_FILE" \
-            | sort -k1,1 \
-            | join - "$TMP_IP2SUB" \
-            | { 
-              awk '
-                NF >= 2 { 
-                  if (NF == 3 && $2 ~ /^[0-9]+$/) { 
-                    print $3 ":" $2 
-                  } else { 
-                    print $NF 
-                  } 
-                }
-              '       
-            } \
-            > "$OUTPUT"
+          awk '
+          FNR==NR {
+            ip = $1
+            sub = ""
+            for (i = 2; i <= NF; i++) {
+              sub = (sub == "" ? $i : sub " " $i)
+            }
+            map[ip] = sub
+            next
+          }
+          
+          {
+            line = $0
+            split(line, parts, ":")
+            ip = parts[1]
+            port = (length(parts) >= 2 ? parts[2] : "")
+            if (map[ip] != "") {
+              if (port != "") {
+                print map[ip] ":" port
+              } else {
+                print map[ip]
+              }
+            }
+          }
+          ' "$TMP_IP2SUB" "$SMAP_FILE" > "$OUTPUT"
+
           
           echo "✅ Generated $OUTPUT for this chunk:"
           head -n50 "$OUTPUT"
